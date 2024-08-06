@@ -26,9 +26,14 @@
     "url": "https://github.com/Clever/saml2/issues"
   },
   "devDependencies": {
+    "@types/async": "^3.2.24",
+    "@types/debug": "^4.1.12",
+    "@types/underscore": "^1.11.15",
+    "@types/xml-encryption": "^1.2.4",
     "coffeescript": "^1.12.7",
     "mocha": "^8.4.0",
-    "nyc": "^15.0.0"
+    "nyc": "^15.0.0",
+    "typescript": "^5.5.4"
   },
   "dependencies": {
     "@xmldom/xmldom": "^0.8.6",
