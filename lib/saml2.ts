@@ -5,7 +5,7 @@ import debug from "debug";
 import url from "url";
 import util from "util";
 import { create } from "xmlbuilder2";
-import { SignedXml } from "xml-crypto";
+import { SignedXml, xpath } from "xml-crypto";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
 import { decrypt } from "xml-encryption";
 import zlib from "zlib";
@@ -30,7 +30,7 @@ interface AuthnRequestResult {
   id: string;
   xml: string;
 }
-
+// Creates an AuthnRequest and returns it as a string of xml along with the randomly generated ID for the created request.
 function create_authn_request(
   issuer: string,
   assert_endpoint: string,
@@ -71,8 +71,6 @@ function create_authn_request(
 
   return { id, xml };
 }
-
-// ... (other functions would be converted similarly)
 
 interface ServiceProviderOptions {
   entity_id: string;
@@ -702,6 +700,468 @@ function create_metadata(
       },
     },
   }).end();
+}
+
+//  Creates an AuthnRequest and returns it as a string of xml along with the randomly generated ID for the created request.
+function signAuthnRequest(
+  xml: string,
+  privateKey: string,
+  options?: any
+): string {
+  const signer = new SignedXml(null, options);
+  signer.addReference("//*[local-name(.)='AuthnRequest']", [
+    "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+    "http://www.w3.org/2001/10/xml-exc-c14n#",
+  ]);
+  signer.signingKey = privateKey;
+  signer.computeSignature(xml);
+  return signer.getSignedXml();
+}
+
+// This checks the signature of a saml document and returns either array containing the signed data if valid, or null if the signature is invalid. Comparing the result against null is NOT sufficient for signature checks as it doesn't verify the signature is signing the important content, nor is it preventing the parsing of unsigned content.
+function check_saml_signature(
+  xml: string,
+  certificate: string
+): string[] | null {
+  const doc = new DOMParser().parseFromString(xml);
+
+  // xpath failed to capture <ds:Signature> nodes of direct descendents of the root. Call documentElement to explicitly start from the root element of the document.
+  const signature = xpath(
+    doc.documentElement,
+    "./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']"
+  );
+  if (signature.length !== 1) return null;
+
+  const sig = new SignedXml();
+  sig.keyInfoProvider = {
+    getKey: () => format_pem(certificate, "CERTIFICATE"),
+  };
+
+  sig.loadSignature(signature[0]);
+  const valid = sig.checkSignature(xml);
+
+  if (valid) {
+    return get_signed_data(doc, sig);
+  } else {
+    return null;
+  }
+}
+// Takes in an xml @dom containing a SAML Status and returns true if at least one status is Success.
+function check_status_success(dom: Document): boolean {
+  const status = dom.getElementsByTagNameNS(XMLNS.SAMLP, "Status");
+  if (status.length !== 1) return false;
+
+  for (let i = 0; i < status[0].childNodes.length; i++) {
+    const statusCode = status[0].childNodes[i] as Element;
+    if (statusCode.attributes) {
+      const statusValue = get_attribute_value(statusCode, "Value");
+      if (statusValue === "urn:oasis:names:tc:SAML:2.0:status:Success") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function pretty_assertion_attributes(
+  assertion_attributes: Record<string, string[]>
+): Record<string, string> {
+  const claim_map: Record<string, string> = {
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress":
+      "email",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname":
+      "given_name",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name": "name",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn": "upn",
+    "http://schemas.xmlsoap.org/claims/CommonName": "common_name",
+    "http://schemas.xmlsoap.org/claims/Group": "group",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/role": "role",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname": "surname",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/privatepersonalidentifier":
+      "ppid",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier":
+      "name_id",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/authenticationmethod":
+      "authentication_method",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/denyonlysid":
+      "deny_only_group_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/denyonlyprimarysid":
+      "deny_only_primary_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/denyonlyprimarygroupsid":
+      "deny_only_primary_group_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/groupsid":
+      "group_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/primarygroupsid":
+      "primary_group_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/primarysid":
+      "primary_sid",
+    "http://schemas.microsoft.com/ws/2008/06/identity/claims/windowsaccountname":
+      "windows_account_name",
+  };
+
+  return _.chain(assertion_attributes)
+    .pairs()
+    .filter(([k, v]) => claim_map[k] && v.length > 0)
+    .map(([k, v]) => [claim_map[k], v[0]])
+    .object()
+    .value();
+}
+
+function decrypt_assertion(
+  dom: Document,
+  private_keys: string[],
+  cb: (err: Error | null, result?: string) => void
+): void {
+  const cb_wrapped = _.wrap(
+    cb,
+    (fn: Function, err: Error | null, ...args: any[]) => {
+      setTimeout(() => fn(to_error(err), ...args), 0);
+    }
+  );
+
+  try {
+    const encrypted_assertion = dom.getElementsByTagNameNS(
+      XMLNS.SAML,
+      "EncryptedAssertion"
+    );
+    if (encrypted_assertion.length !== 1) {
+      return cb_wrapped(
+        new Error(
+          `Expected 1 EncryptedAssertion; found ${encrypted_assertion.length}.`
+        )
+      );
+    }
+
+    const encrypted_data = encrypted_assertion[0].getElementsByTagNameNS(
+      XMLNS.XENC,
+      "EncryptedData"
+    );
+    if (encrypted_data.length !== 1) {
+      return cb_wrapped(
+        new Error(
+          `Expected 1 EncryptedData inside EncryptedAssertion; found ${encrypted_data.length}.`
+        )
+      );
+    }
+
+    const encrypted_assertion_string = encrypted_assertion[0].toString();
+    const errors: Error[] = [];
+
+    async.eachOfSeries(
+      private_keys,
+      (private_key, index, cb_e) => {
+        decrypt(
+          encrypted_assertion_string,
+          { key: format_pem(private_key, "PRIVATE KEY") },
+          (err, result) => {
+            if (err) {
+              errors.push(new Error(`Decrypt failed: ${util.inspect(err)}`));
+              return cb_e();
+            }
+
+            console.log(`Decryption successful with private key #${index}.`);
+            cb_wrapped(null, result);
+          }
+        );
+      },
+      () =>
+        cb_wrapped(
+          new Error(
+            `Failed to decrypt assertion with provided key(s): ${util.inspect(
+              errors
+            )}`
+          )
+        )
+    );
+  } catch (err) {
+    cb_wrapped(new Error(`Decrypt failed: ${util.inspect(err)}`));
+  }
+}
+// Takes in an xml @dom of an object containing a SAML Response and returns an object containing the Destination and
+// InResponseTo attributes of the Response if present. It will throw an error if the Response is missing or does not
+// appear to be valid.
+interface ResponseHeader {
+  version: string;
+  destination: string | null;
+  in_response_to: string | null;
+  id: string | null;
+}
+
+function parse_response_header(dom: Document): ResponseHeader {
+  let response: Element | null = null;
+  const responseTypes = ["Response", "LogoutResponse", "LogoutRequest"];
+
+  for (const responseType of responseTypes) {
+    const elements = dom.getElementsByTagNameNS(XMLNS.SAMLP, responseType);
+    if (elements.length > 0) {
+      response = elements[0];
+      break;
+    }
+  }
+
+  if (!response) {
+    throw new Error(
+      `Expected 1 Response, LogoutResponse, or LogoutRequest; found none`
+    );
+  }
+
+  const responseHeader: ResponseHeader = {
+    version: get_attribute_value(response, "Version") || "2.0",
+    destination: get_attribute_value(response, "Destination"),
+    in_response_to: get_attribute_value(response, "InResponseTo"),
+    id: get_attribute_value(response, "ID"),
+  };
+
+  if (responseHeader.version !== "2.0") {
+    throw new Error(`Invalid SAML Version ${responseHeader.version}`);
+  }
+
+  return responseHeader;
+}
+
+function get_attribute_value(
+  element: Element,
+  attributeName: string
+): string | null {
+  return element.getAttribute(attributeName);
+}
+
+interface LogoutRequest {
+  issuer: string | null;
+  name_id: string | null;
+  session_index: string | null;
+}
+
+function parse_logout_request(dom: Document): LogoutRequest {
+  const request = dom.getElementsByTagNameNS(XMLNS.SAMLP, "LogoutRequest");
+  if (request.length !== 1) {
+    throw new Error(`Expected 1 LogoutRequest; found ${request.length}`);
+  }
+
+  const result: LogoutRequest = {
+    issuer: null,
+    name_id: null,
+    session_index: null,
+  };
+
+  // Parse Issuer
+  const issuer = dom.getElementsByTagNameNS(XMLNS.SAML, "Issuer");
+  if (issuer.length === 1 && issuer[0].firstChild) {
+    result.issuer = issuer[0].firstChild.nodeValue;
+  }
+
+  // Parse NameID
+  const name_id = dom.getElementsByTagNameNS(XMLNS.SAML, "NameID");
+  if (name_id.length === 1 && name_id[0].firstChild) {
+    result.name_id = name_id[0].firstChild.nodeValue;
+  }
+
+  // Parse SessionIndex
+  const session_index = dom.getElementsByTagNameNS(XMLNS.SAMLP, "SessionIndex");
+  if (session_index.length === 1 && session_index[0].firstChild) {
+    result.session_index = session_index[0].firstChild.nodeValue;
+  }
+
+  return result;
+}
+
+function sign_authn_request(
+  xml: string,
+  private_key: string,
+  options?: any
+): string {
+  const signer = new SignedXml(null, options);
+  signer.addReference("//*[local-name(.)='AuthnRequest']", [
+    "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+    "http://www.w3.org/2001/10/xml-exc-c14n#",
+  ]);
+  signer.signingKey = private_key;
+  signer.computeSignature(xml);
+  return signer.getSignedXml();
+}
+
+// Takes a base64 encoded @key and returns it formatted with newlines and a PEM header according to @type. If it already has a PEM header, it will just return the original key.
+function format_pem(key: string, type: string): string {
+  if (/-----BEGIN [0-9A-Z ]+-----[^-]*-----END [0-9A-Z ]+-----/g.exec(key)) {
+    return key;
+  }
+  const matches = key.match(/.{1,64}/g);
+  if (!matches) {
+    throw new Error("Invalid key format");
+  }
+  return `-----BEGIN ${type.toUpperCase()}-----\n${matches.join(
+    "\n"
+  )}\n-----END ${type.toUpperCase()}-----`;
+}
+
+function get_name_id(dom: Document): string | null {
+  const assertion = dom.getElementsByTagNameNS(XMLNS.SAML, "Assertion");
+  if (assertion.length !== 1) {
+    throw new Error(`Expected 1 Assertion; found ${assertion.length}`);
+  }
+
+  const subject = assertion[0].getElementsByTagNameNS(XMLNS.SAML, "Subject");
+  if (subject.length !== 1) {
+    throw new Error(`Expected 1 Subject; found ${subject.length}`);
+  }
+
+  const nameId = subject[0].getElementsByTagNameNS(XMLNS.SAML, "NameID");
+  if (nameId.length !== 1) {
+    return null;
+  }
+
+  return nameId[0].firstChild?.textContent || null;
+}
+
+interface SessionInfo {
+  index: string | null;
+  not_on_or_after: string | null;
+}
+
+function get_session_info(
+  dom: Document,
+  index_required: boolean = true
+): SessionInfo {
+  const assertion = dom.getElementsByTagNameNS(XMLNS.SAML, "Assertion");
+  if (assertion.length !== 1) {
+    throw new Error(`Expected 1 Assertion; found ${assertion.length}`);
+  }
+
+  const authnStatement = assertion[0].getElementsByTagNameNS(
+    XMLNS.SAML,
+    "AuthnStatement"
+  );
+  if (authnStatement.length !== 1) {
+    throw new Error(
+      `Expected 1 AuthnStatement; found ${authnStatement.length}`
+    );
+  }
+
+  const info: SessionInfo = {
+    index: authnStatement[0].getAttribute("SessionIndex"),
+    not_on_or_after: authnStatement[0].getAttribute("SessionNotOnOrAfter"),
+  };
+
+  if (index_required && !info.index) {
+    throw new Error("SessionIndex not an attribute of AuthnStatement.");
+  }
+
+  return info;
+}
+
+function to_error(err: any): Error | null {
+  if (!err) return null;
+  if (err instanceof Error) return err;
+  return new Error(JSON.stringify(err));
+}
+
+function parse_assertion_attributes(dom: Document): Record<string, string[]> {
+  const assertion = dom.getElementsByTagNameNS(XMLNS.SAML, "Assertion");
+  if (assertion.length !== 1) {
+    throw new Error(`Expected 1 Assertion; found ${assertion.length}`);
+  }
+
+  const attributeStatement = assertion[0].getElementsByTagNameNS(
+    XMLNS.SAML,
+    "AttributeStatement"
+  );
+  if (attributeStatement.length > 1) {
+    throw new Error(
+      `Expected 0 or 1 AttributeStatement inside Assertion; found ${attributeStatement.length}`
+    );
+  }
+  if (attributeStatement.length === 0) {
+    return {};
+  }
+
+  const assertionAttributes: Record<string, string[]> = {};
+  const attributes = attributeStatement[0].getElementsByTagNameNS(
+    XMLNS.SAML,
+    "Attribute"
+  );
+
+  for (let i = 0; i < attributes.length; i++) {
+    const attribute = attributes[i];
+    const attributeName = attribute.getAttribute("Name");
+    if (!attributeName) {
+      throw new Error("Invalid attribute without name");
+    }
+    const attributeValues = attribute.getElementsByTagNameNS(
+      XMLNS.SAML,
+      "AttributeValue"
+    );
+    assertionAttributes[attributeName] = Array.from(attributeValues).map(
+      (av) => av.textContent || ""
+    );
+  }
+
+  return assertionAttributes;
+}
+
+function add_namespaces_to_child_assertions(xml_string: string): string {
+  const doc = new DOMParser().parseFromString(xml_string, "text/xml");
+
+  const responseElements = doc.getElementsByTagNameNS(XMLNS.SAMLP, "Response");
+  if (responseElements.length !== 1) {
+    return xml_string;
+  }
+  const responseElement = responseElements[0];
+
+  const assertionElements = responseElement.getElementsByTagNameNS(
+    XMLNS.SAML,
+    "Assertion"
+  );
+  if (assertionElements.length !== 1) {
+    return xml_string;
+  }
+  const assertionElement = assertionElements[0];
+
+  const inclusiveNamespaces = assertionElement.getElementsByTagNameNS(
+    XMLNS.EXC_C14N,
+    "InclusiveNamespaces"
+  )[0];
+  let namespaces: string[] = [];
+
+  if (inclusiveNamespaces) {
+    const prefixList = inclusiveNamespaces.getAttribute("PrefixList");
+    if (prefixList) {
+      namespaces = prefixList
+        .trim()
+        .split(" ")
+        .map((ns) => `xmlns:${ns}`);
+    }
+  } else {
+    namespaces = Array.from(responseElement.attributes)
+      .filter((attr) => attr.name.startsWith("xmlns:"))
+      .map((attr) => attr.name);
+  }
+
+  // Add namespaces present in response and missing in assertion
+  namespaces.forEach((ns) => {
+    if (
+      responseElement.hasAttribute(ns) &&
+      !assertionElement.hasAttribute(ns)
+    ) {
+      const value = responseElement.getAttribute(ns);
+      if (value) {
+        assertionElement.setAttribute(ns, value);
+      }
+    }
+  });
+
+  return new XMLSerializer().serializeToString(responseElement);
+}
+
+function extract_certificate_data(certificate: string): string {
+  const certData =
+    /-----BEGIN CERTIFICATE-----([^-]*)-----END CERTIFICATE-----/g.exec(
+      certificate
+    );
+  if (!certData) {
+    throw new Error("Invalid Certificate");
+  }
+
+  return certData[1].replace(/[\r\n]/g, "");
 }
 
 export {
