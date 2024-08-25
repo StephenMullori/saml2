@@ -12,12 +12,12 @@ import zlib from "zlib";
 import { ParsedUrlQuery } from "querystring";
 
 const XMLNS = {
-  SAML: "urn:oasis:names:tc:SAML:2.0:assertion",
-  SAMLP: "urn:oasis:names:tc:SAML:2.0:protocol",
-  MD: "urn:oasis:names:tc:SAML:2.0:metadata",
-  DS: "http://www.w3.org/2000/09/xmldsig#",
-  XENC: "http://www.w3.org/2001/04/xmlenc#",
-  EXC_C14N: "http://www.w3.org/2001/10/xml-exc-c14n#",
+  SAML: 'urn:oasis:names:tc:SAML:2.0:assertion',
+  SAMLP: 'urn:oasis:names:tc:SAML:2.0:protocol',
+  MD: 'urn:oasis:names:tc:SAML:2.0:metadata',
+  DS: 'http://www.w3.org/2000/09/xmldsig#',
+  XENC: 'http://www.w3.org/2001/04/xmlenc#',
+  EXC_C14N: 'http://www.w3.org/2001/10/xml-exc-c14n#'
 };
 
 class SAMLError extends Error {
@@ -39,14 +39,15 @@ function create_authn_request(
   context: any,
   nameid_format?: string
 ): AuthnRequestResult {
-  const context_element = context
-    ? {
-        "saml:AuthnContextClassRef": context.class_refs,
-        "@Comparison": context.comparison,
-      }
-    : undefined;
+  let context_element;
+  if(context != null){
+    context_element = { 
+      'saml:AuthnContextClassRef': context.class_refs,
+      '@Comparison': context.comparison }
+  }
 
   const id = "_" + crypto.randomBytes(21).toString("hex");
+
   const xml = create({
     AuthnRequest: {
       "@xmlns": XMLNS.SAMLP,
